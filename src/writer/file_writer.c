@@ -33,6 +33,11 @@ typedef struct column_chunk_info {
     int64_t total_compressed_size;
     int64_t total_uncompressed_size;
     int64_t num_values;
+    bool has_statistics;
+    int64_t null_count;
+    uint8_t min_value[64];
+    uint8_t max_value[64];
+    size_t min_max_size;
     carquet_physical_type_t type;
     carquet_encoding_t encoding;
     carquet_compression_t compression;
@@ -55,6 +60,7 @@ extern carquet_status_t carquet_row_group_writer_add_column(
     carquet_row_group_writer_t* writer,
     const char* name,
     carquet_physical_type_t type,
+    const carquet_logical_type_t* logical_type,
     int16_t max_def_level,
     int16_t max_rep_level,
     int32_t type_length);
@@ -136,6 +142,11 @@ typedef struct row_group_column_info {
     int64_t total_compressed_size;
     int64_t total_uncompressed_size;
     int64_t num_values;
+    bool has_statistics;
+    int64_t null_count;
+    uint8_t min_value[64];
+    uint8_t max_value[64];
+    size_t min_max_size;
     carquet_physical_type_t type;
     carquet_compression_t codec;
     int64_t data_page_offset;
@@ -582,6 +593,7 @@ static carquet_status_t ensure_row_group(carquet_writer_t* writer) {
             writer->current_row_group,
             col->name,
             col->physical_type,
+            &col->logical_type,
             col->max_def_level,
             col->max_rep_level,
             col->type_length);
@@ -658,6 +670,13 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
         chunk->type = col_info->type;
         chunk->codec = col_info->compression;
         chunk->num_values = col_info->num_values;
+        chunk->has_statistics = col_info->has_statistics;
+        chunk->null_count = col_info->null_count;
+        chunk->min_max_size = col_info->min_max_size;
+        if (col_info->has_statistics) {
+            memcpy(chunk->min_value, col_info->min_value, col_info->min_max_size);
+            memcpy(chunk->max_value, col_info->max_value, col_info->min_max_size);
+        }
         chunk->total_compressed_size = col_info->total_compressed_size;
         chunk->total_uncompressed_size = col_info->total_uncompressed_size;
         chunk->data_page_offset = col_info->file_offset;
@@ -883,6 +902,23 @@ static carquet_status_t build_file_metadata(
             meta->total_compressed_size = src_col->total_compressed_size;
             meta->total_uncompressed_size = src_col->total_uncompressed_size;
             meta->data_page_offset = src_col->data_page_offset;
+            if (src_col->has_statistics) {
+                meta->has_statistics = true;
+                meta->statistics.has_null_count = true;
+                meta->statistics.null_count = src_col->null_count;
+                meta->statistics.min_value = carquet_arena_memdup(
+                    &writer->arena, src_col->min_value, src_col->min_max_size);
+                meta->statistics.min_value_len = (int32_t)src_col->min_max_size;
+                meta->statistics.max_value = carquet_arena_memdup(
+                    &writer->arena, src_col->max_value, src_col->min_max_size);
+                meta->statistics.max_value_len = (int32_t)src_col->min_max_size;
+                meta->statistics.is_max_value_exact = true;
+                meta->statistics.is_min_value_exact = true;
+                if ((!meta->statistics.min_value || !meta->statistics.max_value) &&
+                    src_col->min_max_size > 0) {
+                    return CARQUET_ERROR_OUT_OF_MEMORY;
+                }
+            }
             meta->num_encodings = 2;
             meta->encodings = writer->column_encodings[j];
             meta->path_len = writer->column_path_lens[j];

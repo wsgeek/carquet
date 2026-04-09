@@ -108,6 +108,7 @@ typedef struct carquet_page_writer {
     uint8_t min_value[64];
     uint8_t max_value[64];
     size_t min_max_size;
+    bool integer_is_unsigned;
 } carquet_page_writer_t;
 
 /* Forward declaration for internal use */
@@ -118,6 +119,86 @@ carquet_status_t carquet_page_writer_finalize_to_buffer(
     size_t* page_size,
     int32_t* uncompressed_size,
     int32_t* compressed_size);
+
+static bool logical_type_is_unsigned_integer(
+    carquet_physical_type_t physical_type,
+    const carquet_logical_type_t* logical_type) {
+    if (!logical_type || logical_type->id != CARQUET_LOGICAL_INTEGER ||
+        logical_type->params.integer.is_signed) {
+        return false;
+    }
+
+    switch (physical_type) {
+        case CARQUET_PHYSICAL_INT32:
+            return logical_type->params.integer.bit_width > 0 &&
+                   logical_type->params.integer.bit_width <= 32;
+        case CARQUET_PHYSICAL_INT64:
+            return logical_type->params.integer.bit_width > 32 &&
+                   logical_type->params.integer.bit_width <= 64;
+        default:
+            return false;
+    }
+}
+
+static int compare_i32_values(int32_t lhs, int32_t rhs, bool is_unsigned) {
+    if (is_unsigned) {
+        uint32_t lhs_u = (uint32_t)lhs;
+        uint32_t rhs_u = (uint32_t)rhs;
+        return (lhs_u > rhs_u) - (lhs_u < rhs_u);
+    }
+    return (lhs > rhs) - (lhs < rhs);
+}
+
+static int compare_i64_values(int64_t lhs, int64_t rhs, bool is_unsigned) {
+    if (is_unsigned) {
+        uint64_t lhs_u = (uint64_t)lhs;
+        uint64_t rhs_u = (uint64_t)rhs;
+        return (lhs_u > rhs_u) - (lhs_u < rhs_u);
+    }
+    return (lhs > rhs) - (lhs < rhs);
+}
+
+static void compute_minmax_i32(
+    const carquet_page_writer_t* writer,
+    const int32_t* values,
+    int64_t count,
+    int32_t* min_value,
+    int32_t* max_value) {
+    if (!writer->integer_is_unsigned) {
+        carquet_dispatch_minmax_i32(values, count, min_value, max_value);
+        return;
+    }
+
+    int32_t min_v = values[0];
+    int32_t max_v = values[0];
+    for (int64_t i = 1; i < count; i++) {
+        if (compare_i32_values(values[i], min_v, true) < 0) min_v = values[i];
+        if (compare_i32_values(values[i], max_v, true) > 0) max_v = values[i];
+    }
+    *min_value = min_v;
+    *max_value = max_v;
+}
+
+static void compute_minmax_i64(
+    const carquet_page_writer_t* writer,
+    const int64_t* values,
+    int64_t count,
+    int64_t* min_value,
+    int64_t* max_value) {
+    if (!writer->integer_is_unsigned) {
+        carquet_dispatch_minmax_i64(values, count, min_value, max_value);
+        return;
+    }
+
+    int64_t min_v = values[0];
+    int64_t max_v = values[0];
+    for (int64_t i = 1; i < count; i++) {
+        if (compare_i64_values(values[i], min_v, true) < 0) min_v = values[i];
+        if (compare_i64_values(values[i], max_v, true) > 0) max_v = values[i];
+    }
+    *min_value = min_v;
+    *max_value = max_v;
+}
 
 /* ============================================================================
  * Page Writer Lifecycle
@@ -131,6 +212,7 @@ carquet_page_writer_t* carquet_page_writer_create(
     int16_t max_def_level,
     int16_t max_rep_level,
     int32_t type_length,
+    const carquet_logical_type_t* logical_type,
     int32_t compression_level) {
 
     carquet_page_writer_t* writer = calloc(1, sizeof(carquet_page_writer_t));
@@ -149,6 +231,7 @@ carquet_page_writer_t* carquet_page_writer_create(
     writer->max_def_level = max_def_level;
     writer->max_rep_level = max_rep_level;
     writer->type_length = type_length;
+    writer->integer_is_unsigned = logical_type_is_unsigned_integer(type, logical_type);
     writer->compression_level = compression_level;
     writer->write_crc = true;         /* Enable CRC by default for integrity */
     writer->write_statistics = true;  /* Enable statistics by default for pushdown */
@@ -253,7 +336,7 @@ static void update_statistics_i32(carquet_page_writer_t* writer,
     if (count <= 0) return;
     if (!writer->has_min_max) {
         int32_t min_v, max_v;
-        carquet_dispatch_minmax_i32(values, count, &min_v, &max_v);
+        compute_minmax_i32(writer, values, count, &min_v, &max_v);
         writer->has_min_max = true;
         writer->min_max_size = sizeof(int32_t);
         memcpy(writer->min_value, &min_v, sizeof(min_v));
@@ -264,9 +347,9 @@ static void update_statistics_i32(carquet_page_writer_t* writer,
     int32_t chunk_min, chunk_max;
     memcpy(&min_v, writer->min_value, sizeof(min_v));
     memcpy(&max_v, writer->max_value, sizeof(max_v));
-    carquet_dispatch_minmax_i32(values, count, &chunk_min, &chunk_max);
-    if (chunk_min < min_v) min_v = chunk_min;
-    if (chunk_max > max_v) max_v = chunk_max;
+    compute_minmax_i32(writer, values, count, &chunk_min, &chunk_max);
+    if (compare_i32_values(chunk_min, min_v, writer->integer_is_unsigned) < 0) min_v = chunk_min;
+    if (compare_i32_values(chunk_max, max_v, writer->integer_is_unsigned) > 0) max_v = chunk_max;
     memcpy(writer->min_value, &min_v, sizeof(min_v));
     memcpy(writer->max_value, &max_v, sizeof(max_v));
 }
@@ -276,7 +359,7 @@ static void update_statistics_i64(carquet_page_writer_t* writer,
     if (count <= 0) return;
     if (!writer->has_min_max) {
         int64_t min_v, max_v;
-        carquet_dispatch_minmax_i64(values, count, &min_v, &max_v);
+        compute_minmax_i64(writer, values, count, &min_v, &max_v);
         writer->has_min_max = true;
         writer->min_max_size = sizeof(int64_t);
         memcpy(writer->min_value, &min_v, sizeof(min_v));
@@ -287,9 +370,9 @@ static void update_statistics_i64(carquet_page_writer_t* writer,
     int64_t chunk_min, chunk_max;
     memcpy(&min_v, writer->min_value, sizeof(min_v));
     memcpy(&max_v, writer->max_value, sizeof(max_v));
-    carquet_dispatch_minmax_i64(values, count, &chunk_min, &chunk_max);
-    if (chunk_min < min_v) min_v = chunk_min;
-    if (chunk_max > max_v) max_v = chunk_max;
+    compute_minmax_i64(writer, values, count, &chunk_min, &chunk_max);
+    if (compare_i64_values(chunk_min, min_v, writer->integer_is_unsigned) < 0) min_v = chunk_min;
+    if (compare_i64_values(chunk_max, max_v, writer->integer_is_unsigned) > 0) max_v = chunk_max;
     memcpy(writer->min_value, &min_v, sizeof(min_v));
     memcpy(writer->max_value, &max_v, sizeof(max_v));
 }
@@ -351,7 +434,8 @@ static carquet_status_t encode_plain_i32_with_stats(
     if (!dest) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
-    carquet_dispatch_copy_minmax_i32(values, count, (int32_t*)dest, &min_v, &max_v);
+    memcpy(dest, values, bytes_needed);
+    compute_minmax_i32(writer, values, count, &min_v, &max_v);
     if (!writer->has_min_max) {
         writer->has_min_max = true;
         writer->min_max_size = sizeof(min_v);
@@ -359,8 +443,8 @@ static carquet_status_t encode_plain_i32_with_stats(
         int32_t cur_min, cur_max;
         memcpy(&cur_min, writer->min_value, sizeof(cur_min));
         memcpy(&cur_max, writer->max_value, sizeof(cur_max));
-        if (cur_min < min_v) min_v = cur_min;
-        if (cur_max > max_v) max_v = cur_max;
+        if (compare_i32_values(cur_min, min_v, writer->integer_is_unsigned) < 0) min_v = cur_min;
+        if (compare_i32_values(cur_max, max_v, writer->integer_is_unsigned) > 0) max_v = cur_max;
     }
     memcpy(writer->min_value, &min_v, sizeof(min_v));
     memcpy(writer->max_value, &max_v, sizeof(max_v));
@@ -385,7 +469,8 @@ static carquet_status_t encode_plain_i64_with_stats(
     if (!dest) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
-    carquet_dispatch_copy_minmax_i64(values, count, (int64_t*)dest, &min_v, &max_v);
+    memcpy(dest, values, bytes_needed);
+    compute_minmax_i64(writer, values, count, &min_v, &max_v);
     if (!writer->has_min_max) {
         writer->has_min_max = true;
         writer->min_max_size = sizeof(min_v);
@@ -393,8 +478,8 @@ static carquet_status_t encode_plain_i64_with_stats(
         int64_t cur_min, cur_max;
         memcpy(&cur_min, writer->min_value, sizeof(cur_min));
         memcpy(&cur_max, writer->max_value, sizeof(cur_max));
-        if (cur_min < min_v) min_v = cur_min;
-        if (cur_max > max_v) max_v = cur_max;
+        if (compare_i64_values(cur_min, min_v, writer->integer_is_unsigned) < 0) min_v = cur_min;
+        if (compare_i64_values(cur_max, max_v, writer->integer_is_unsigned) > 0) max_v = cur_max;
     }
     memcpy(writer->min_value, &min_v, sizeof(min_v));
     memcpy(writer->max_value, &max_v, sizeof(max_v));

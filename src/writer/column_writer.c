@@ -59,6 +59,7 @@ extern carquet_page_writer_t* carquet_page_writer_create(
     int16_t max_def_level,
     int16_t max_rep_level,
     int32_t type_length,
+    const carquet_logical_type_t* logical_type,
     int32_t compression_level);
 
 extern void carquet_page_writer_destroy(carquet_page_writer_t* writer);
@@ -100,6 +101,7 @@ typedef struct carquet_column_writer_internal {
 
     /* Column configuration */
     carquet_physical_type_t type;
+    bool integer_is_unsigned;
     carquet_encoding_t encoding;
     carquet_compression_t compression;
     int32_t type_length;
@@ -139,6 +141,83 @@ typedef struct carquet_column_writer_internal {
     int64_t column_file_offset;   /* File offset where this column starts */
 } carquet_column_writer_internal_t;
 
+static bool logical_type_is_unsigned_integer(
+    carquet_physical_type_t physical_type,
+    const carquet_logical_type_t* logical_type) {
+    if (!logical_type || logical_type->id != CARQUET_LOGICAL_INTEGER ||
+        logical_type->params.integer.is_signed) {
+        return false;
+    }
+
+    switch (physical_type) {
+        case CARQUET_PHYSICAL_INT32:
+            return logical_type->params.integer.bit_width > 0 &&
+                   logical_type->params.integer.bit_width <= 32;
+        case CARQUET_PHYSICAL_INT64:
+            return logical_type->params.integer.bit_width > 32 &&
+                   logical_type->params.integer.bit_width <= 64;
+        default:
+            return false;
+    }
+}
+
+static int compare_i32_values(int32_t lhs, int32_t rhs, bool is_unsigned) {
+    if (is_unsigned) {
+        uint32_t lhs_u = (uint32_t)lhs;
+        uint32_t rhs_u = (uint32_t)rhs;
+        return (lhs_u > rhs_u) - (lhs_u < rhs_u);
+    }
+    return (lhs > rhs) - (lhs < rhs);
+}
+
+static int compare_i64_values(int64_t lhs, int64_t rhs, bool is_unsigned) {
+    if (is_unsigned) {
+        uint64_t lhs_u = (uint64_t)lhs;
+        uint64_t rhs_u = (uint64_t)rhs;
+        return (lhs_u > rhs_u) - (lhs_u < rhs_u);
+    }
+    return (lhs > rhs) - (lhs < rhs);
+}
+
+static int compare_statistics_values(
+    const carquet_column_writer_internal_t* writer,
+    const uint8_t* lhs,
+    const uint8_t* rhs,
+    size_t size) {
+    switch (writer->type) {
+        case CARQUET_PHYSICAL_INT32: {
+            int32_t lhs_value;
+            int32_t rhs_value;
+            memcpy(&lhs_value, lhs, sizeof(lhs_value));
+            memcpy(&rhs_value, rhs, sizeof(rhs_value));
+            return compare_i32_values(lhs_value, rhs_value, writer->integer_is_unsigned);
+        }
+        case CARQUET_PHYSICAL_INT64: {
+            int64_t lhs_value;
+            int64_t rhs_value;
+            memcpy(&lhs_value, lhs, sizeof(lhs_value));
+            memcpy(&rhs_value, rhs, sizeof(rhs_value));
+            return compare_i64_values(lhs_value, rhs_value, writer->integer_is_unsigned);
+        }
+        case CARQUET_PHYSICAL_FLOAT: {
+            float lhs_value;
+            float rhs_value;
+            memcpy(&lhs_value, lhs, sizeof(lhs_value));
+            memcpy(&rhs_value, rhs, sizeof(rhs_value));
+            return (lhs_value > rhs_value) - (lhs_value < rhs_value);
+        }
+        case CARQUET_PHYSICAL_DOUBLE: {
+            double lhs_value;
+            double rhs_value;
+            memcpy(&lhs_value, lhs, sizeof(lhs_value));
+            memcpy(&rhs_value, rhs, sizeof(rhs_value));
+            return (lhs_value > rhs_value) - (lhs_value < rhs_value);
+        }
+        default:
+            return memcmp(lhs, rhs, size);
+    }
+}
+
 /* ============================================================================
  * Column Writer Lifecycle
  * ============================================================================
@@ -152,6 +231,7 @@ carquet_column_writer_internal_t* carquet_column_writer_create(
     int16_t max_rep_level,
     int32_t type_length,
     size_t target_page_size,
+    const carquet_logical_type_t* logical_type,
     int32_t compression_level) {
 
     carquet_column_writer_internal_t* writer = calloc(1, sizeof(*writer));
@@ -159,6 +239,7 @@ carquet_column_writer_internal_t* carquet_column_writer_create(
 
     writer->page_writer = carquet_page_writer_create(
         type, encoding, compression, max_def_level, max_rep_level, type_length,
+        logical_type,
         compression_level);
 
     if (!writer->page_writer) {
@@ -169,6 +250,7 @@ carquet_column_writer_internal_t* carquet_column_writer_create(
     carquet_buffer_init(&writer->column_buffer);
 
     writer->type = type;
+    writer->integer_is_unsigned = logical_type_is_unsigned_integer(type, logical_type);
     writer->encoding = encoding;
     writer->compression = compression;
     writer->type_length = type_length;
@@ -278,13 +360,11 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
     const uint8_t* page_min = NULL;
     const uint8_t* page_max = NULL;
     size_t stat_size = 0;
-    int64_t page_null_count = 0;
+    int64_t page_null_count = carquet_page_writer_null_count(writer->page_writer);
     bool has_stats = false;
 
-    if (writer->column_index) {
-        has_stats = carquet_page_writer_get_statistics(
-            writer->page_writer, &page_min, &page_max, &stat_size, &page_null_count);
-    }
+    has_stats = carquet_page_writer_get_statistics(
+        writer->page_writer, &page_min, &page_max, &stat_size, NULL);
 
     size_t page_start = writer->column_buffer.size;
     carquet_status_t status = carquet_page_writer_finalize_to_buffer(
@@ -298,7 +378,6 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
     /* Record page index entries before appending */
     if (writer->column_index) {
         bool is_null_page = !has_stats;
-        if (!page_null_count) page_null_count = carquet_page_writer_null_count(writer->page_writer);
         carquet_column_index_add_page(
             writer->column_index,
             page_null_count,
@@ -320,6 +399,22 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
     }
 
     /* Update statistics */
+    writer->total_nulls += page_null_count;
+    if (has_stats) {
+        if (!writer->has_min_max) {
+            writer->has_min_max = true;
+            writer->min_max_size = stat_size;
+            memcpy(writer->min_value, page_min, stat_size);
+            memcpy(writer->max_value, page_max, stat_size);
+        } else {
+            if (compare_statistics_values(writer, page_min, writer->min_value, stat_size) < 0) {
+                memcpy(writer->min_value, page_min, stat_size);
+            }
+            if (compare_statistics_values(writer, page_max, writer->max_value, stat_size) > 0) {
+                memcpy(writer->max_value, page_max, stat_size);
+            }
+        }
+    }
     writer->total_uncompressed_size += uncompressed_size;
     writer->total_compressed_size += compressed_size;
     writer->num_pages++;
@@ -563,4 +658,25 @@ carquet_column_index_builder_t* carquet_column_writer_get_column_index(
 carquet_offset_index_builder_t* carquet_column_writer_get_offset_index(
     const carquet_column_writer_internal_t* writer) {
     return writer ? writer->offset_index : NULL;
+}
+
+bool carquet_column_writer_get_statistics(
+    const carquet_column_writer_internal_t* writer,
+    const uint8_t** min_value,
+    const uint8_t** max_value,
+    size_t* value_size,
+    int64_t* null_count) {
+    if (!writer) {
+        return false;
+    }
+
+    if (null_count) *null_count = writer->total_nulls;
+    if (!writer->has_min_max) {
+        return false;
+    }
+
+    if (min_value) *min_value = writer->min_value;
+    if (max_value) *max_value = writer->max_value;
+    if (value_size) *value_size = writer->min_max_size;
+    return true;
 }

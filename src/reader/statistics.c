@@ -17,15 +17,54 @@
  * ============================================================================
  */
 
+static bool logical_type_is_unsigned_integer(
+    const parquet_schema_element_t* elem,
+    carquet_physical_type_t physical_type) {
+    if (!elem || !elem->has_logical_type ||
+        elem->logical_type.id != CARQUET_LOGICAL_INTEGER ||
+        elem->logical_type.params.integer.is_signed) {
+        return false;
+    }
+
+    switch (physical_type) {
+        case CARQUET_PHYSICAL_INT32:
+            return elem->logical_type.params.integer.bit_width > 0 &&
+                   elem->logical_type.params.integer.bit_width <= 32;
+        case CARQUET_PHYSICAL_INT64:
+            return elem->logical_type.params.integer.bit_width > 32 &&
+                   elem->logical_type.params.integer.bit_width <= 64;
+        default:
+            return false;
+    }
+}
+
+static int compare_boolean(const void* a, const void* b) {
+    uint8_t va = *(const uint8_t*)a;
+    uint8_t vb = *(const uint8_t*)b;
+    return (va > vb) - (va < vb);
+}
+
 static int compare_int32(const void* a, const void* b) {
     int32_t va = *(const int32_t*)a;
     int32_t vb = *(const int32_t*)b;
     return (va > vb) - (va < vb);
 }
 
+static int compare_uint32(const void* a, const void* b) {
+    uint32_t va = *(const uint32_t*)a;
+    uint32_t vb = *(const uint32_t*)b;
+    return (va > vb) - (va < vb);
+}
+
 static int compare_int64(const void* a, const void* b) {
     int64_t va = *(const int64_t*)a;
     int64_t vb = *(const int64_t*)b;
+    return (va > vb) - (va < vb);
+}
+
+static int compare_uint64(const void* a, const void* b) {
+    uint64_t va = *(const uint64_t*)a;
+    uint64_t vb = *(const uint64_t*)b;
     return (va > vb) - (va < vb);
 }
 
@@ -54,13 +93,16 @@ static int compare_bytes(const void* a, size_t a_len, const void* b, size_t b_le
 
 typedef int (*compare_fn_t)(const void*, const void*);
 
-static compare_fn_t get_compare_fn(carquet_physical_type_t type) {
+static compare_fn_t get_compare_fn(
+    carquet_physical_type_t type,
+    const parquet_schema_element_t* elem) {
     switch (type) {
-        case CARQUET_PHYSICAL_INT32:
         case CARQUET_PHYSICAL_BOOLEAN:
-            return compare_int32;
+            return compare_boolean;
+        case CARQUET_PHYSICAL_INT32:
+            return logical_type_is_unsigned_integer(elem, type) ? compare_uint32 : compare_int32;
         case CARQUET_PHYSICAL_INT64:
-            return compare_int64;
+            return logical_type_is_unsigned_integer(elem, type) ? compare_uint64 : compare_int64;
         case CARQUET_PHYSICAL_FLOAT:
             return compare_float;
         case CARQUET_PHYSICAL_DOUBLE:
@@ -180,7 +222,7 @@ carquet_status_t carquet_reader_row_group_matches(
     const parquet_schema_element_t* elem = &reader->schema->elements[schema_idx];
     carquet_physical_type_t type = elem->has_type ? elem->type : CARQUET_PHYSICAL_BYTE_ARRAY;
 
-    compare_fn_t cmp_fn = get_compare_fn(type);
+    compare_fn_t cmp_fn = get_compare_fn(type, elem);
 
     int cmp_min, cmp_max;
 
