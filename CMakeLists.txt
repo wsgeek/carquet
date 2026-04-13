@@ -112,6 +112,8 @@ else()
 endif()
 
 # Try to find system lz4 first, fetch if not found
+set(CARQUET_HAVE_LZ4 FALSE)
+
 # Prefer CMake config (gives proper targets with full paths on all platforms)
 find_package(lz4 CONFIG QUIET)
 if(lz4_FOUND)
@@ -127,29 +129,57 @@ if(lz4_FOUND)
     endif()
     # Only mark as found if we actually resolved a target
     if(LZ4_LIBRARIES)
-        set(LZ4_FOUND TRUE)
+        set(CARQUET_HAVE_LZ4 TRUE)
     else()
         message(STATUS "lz4 CMake config found but no known target — trying pkg-config")
-        set(LZ4_FOUND FALSE)
     endif()
 endif()
 
-if(NOT LZ4_FOUND)
+if(NOT CARQUET_HAVE_LZ4)
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
+        # pkg_check_modules caches LZ4_* results. Clear those entries before
+        # re-resolving so reconfigure cannot get stuck with stale bare -llz4.
+        unset(LZ4_FOUND)
+        unset(LZ4_LIBRARIES)
+        unset(LZ4_LINK_LIBRARIES)
+        unset(LZ4_LIBRARY_DIRS)
+        unset(LZ4_LIBDIR)
+        unset(LZ4_LDFLAGS)
+        unset(LZ4_INCLUDE_DIRS)
+        unset(pkgcfg_lib_LZ4_lz4)
+        unset(LZ4_FOUND CACHE)
+        unset(LZ4_LIBRARIES CACHE)
+        unset(LZ4_LINK_LIBRARIES CACHE)
+        unset(LZ4_LIBRARY_DIRS CACHE)
+        unset(LZ4_LIBDIR CACHE)
+        unset(LZ4_LDFLAGS CACHE)
+        unset(LZ4_INCLUDE_DIRS CACHE)
+        unset(pkgcfg_lib_LZ4_lz4 CACHE)
         pkg_check_modules(LZ4 QUIET liblz4)
         if(LZ4_FOUND)
             message(STATUS "Found system liblz4 via pkg-config")
-            # Use LINK_LIBRARIES (full paths) instead of LIBRARIES (bare names)
-            # to avoid MSVC linker failing to locate the .lib file
-            if(LZ4_LINK_LIBRARIES)
+            # pkg-config may reduce this to a bare "lz4". Resolve the concrete
+            # library file from the pkg-config-reported search paths so
+            # downstream links do not depend on the caller's default search path.
+            find_library(
+                LZ4_LIBRARY_FILE
+                NAMES lz4 liblz4
+                HINTS ${LZ4_LIBRARY_DIRS} ${LZ4_LIBDIR}
+            )
+            if(LZ4_LIBRARY_FILE)
+                set(LZ4_LIBRARIES ${LZ4_LIBRARY_FILE})
+            elseif(LZ4_LINK_LIBRARIES)
                 set(LZ4_LIBRARIES ${LZ4_LINK_LIBRARIES})
+            endif()
+            if(LZ4_LIBRARIES)
+                set(CARQUET_HAVE_LZ4 TRUE)
             endif()
         endif()
     endif()
 endif()
 
-if(NOT LZ4_FOUND)
+if(NOT CARQUET_HAVE_LZ4)
     message(STATUS "Fetching lz4...")
     FetchContent_Declare(
         lz4
