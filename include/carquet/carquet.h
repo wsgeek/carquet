@@ -2128,7 +2128,8 @@ carquet_writer_t* carquet_writer_create_file(
  * @param[in] column_index Column index
  * @param[in] values Input values (type must match column physical type).
  *                    For nullable columns, this contains only the non-null
- *                    values, packed contiguously (sparse encoding).
+ *                    values, packed contiguously (sparse encoding); NULL
+ *                    when every row of the batch is null.
  * @param[in] num_values Number of logical rows (length of def_levels if provided)
  * @param[in] def_levels Definition levels (NULL if all values defined).
  *                        One entry per logical row.
@@ -2158,7 +2159,7 @@ carquet_writer_t* carquet_writer_create_file(
  * carquet_writer_write_batch(writer, 1, values, 5, def_levels, NULL);
  * @endcode
  */
-CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 3)
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
 carquet_status_t carquet_writer_write_batch(
     carquet_writer_t* writer,
     int32_t column_index,

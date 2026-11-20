@@ -98,10 +98,12 @@ static void parse_statistics(thrift_decoder_t* dec, carquet_arena_t* arena,
                 stats->distinct_count = thrift_read_i64(dec);
                 break;
             case 5:  /* max_value */
+                stats->has_max_value = true;
                 stats->max_value = arena_bindup_thrift(arena, dec,
                     &stats->max_value_len);
                 break;
             case 6:  /* min_value */
+                stats->has_min_value = true;
                 stats->min_value = arena_bindup_thrift(arena, dec,
                     &stats->min_value_len);
                 break;
@@ -870,14 +872,14 @@ static void write_statistics(thrift_encoder_t* enc, const parquet_statistics_t* 
         thrift_write_i64(enc, stats->distinct_count);
     }
 
-    /* Field 5: max_value */
-    if (stats->max_value && stats->max_value_len > 0) {
+    /* Field 5: max_value (an empty string is a bound) */
+    if (stats->has_max_value) {
         thrift_write_field_header(enc, THRIFT_TYPE_BINARY, 5);
         thrift_write_binary(enc, stats->max_value, stats->max_value_len);
     }
 
     /* Field 6: min_value */
-    if (stats->min_value && stats->min_value_len > 0) {
+    if (stats->has_min_value) {
         thrift_write_field_header(enc, THRIFT_TYPE_BINARY, 6);
         thrift_write_binary(enc, stats->min_value, stats->min_value_len);
     }
@@ -1314,6 +1316,20 @@ carquet_status_t parquet_write_file_metadata(
     if (metadata->created_by) {
         thrift_write_field_header(&enc, THRIFT_TYPE_BINARY, 6);
         thrift_write_string(&enc, metadata->created_by);
+    }
+
+    /* Field 7: column_orders, a ColumnOrder union per leaf whose member is
+     * field 1, TYPE_ORDER (an empty TypeDefinedOrder struct). */
+    if (metadata->num_type_defined_column_orders > 0) {
+        thrift_write_field_header(&enc, THRIFT_TYPE_LIST, 7);
+        thrift_write_list_begin(&enc, THRIFT_TYPE_STRUCT, metadata->num_type_defined_column_orders);
+        for (int32_t i = 0; i < metadata->num_type_defined_column_orders; i++) {
+            thrift_write_struct_begin(&enc);
+            thrift_write_field_header(&enc, THRIFT_TYPE_STRUCT, 1);
+            thrift_write_struct_begin(&enc);
+            thrift_write_struct_end(&enc);
+            thrift_write_struct_end(&enc);
+        }
     }
 
     thrift_write_struct_end(&enc);

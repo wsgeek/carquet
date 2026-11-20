@@ -388,6 +388,7 @@ carquet_status_t carquet_statistics_build(
             }
         }
         if (stats->min_value) {
+            stats->has_min_value = true;
             stats->min_value_len = (int32_t)builder->min_len;
             stats->has_is_min_value_exact = true;
             stats->is_min_value_exact = true;
@@ -406,6 +407,7 @@ carquet_status_t carquet_statistics_build(
             }
         }
         if (stats->max_value) {
+            stats->has_max_value = true;
             stats->max_value_len = (int32_t)builder->max_len;
             stats->has_is_max_value_exact = true;
             stats->is_max_value_exact = true;

@@ -9,6 +9,7 @@
 #include <carquet/error.h>
 #include <carquet/types.h>
 #include "rle.h"
+#include "dictionary.h"
 #include "core/buffer.h"
 #include "core/endian.h"
 #include <stdint.h>
@@ -199,20 +200,11 @@ static void dict_builder_destroy(dict_builder_t* builder) {
     free(builder->indices);
 }
 
-static carquet_status_t dict_builder_add(dict_builder_t* builder,
-                                          const uint8_t* value,
-                                          size_t value_size) {
-    /* Ensure indices array has space */
-    if (builder->indices_count >= builder->indices_capacity) {
-        size_t new_cap = builder->indices_capacity * 2;
-        uint32_t* new_indices = realloc(builder->indices, new_cap * sizeof(uint32_t));
-        if (!new_indices) {
-            return CARQUET_ERROR_OUT_OF_MEMORY;
-        }
-        builder->indices = new_indices;
-        builder->indices_capacity = new_cap;
-    }
-
+/* Finds the value's entry or adds it, returning its index. */
+static carquet_status_t dict_builder_find_or_insert(dict_builder_t* builder,
+                                                    const uint8_t* value,
+                                                    size_t value_size,
+                                                    uint32_t* index) {
     /* Look up in hash table (bitmask since num_buckets is power of 2) */
     uint32_t hash = dict_hash(value, value_size);
     size_t mask = builder->num_buckets - 1;
@@ -221,9 +213,8 @@ static carquet_status_t dict_builder_add(dict_builder_t* builder,
     for (dict_entry_t* entry = builder->buckets[bucket]; entry; entry = entry->next) {
         if (entry->hash == hash &&
             entry->size == value_size &&
-            memcmp(entry->data, value, value_size) == 0) {
-            /* Found existing entry */
-            builder->indices[builder->indices_count++] = entry->index;
+            (value_size == 0 || memcmp(entry->data, value, value_size) == 0)) {
+            *index = entry->index;
             return CARQUET_OK;
         }
     }
@@ -238,32 +229,102 @@ static carquet_status_t dict_builder_add(dict_builder_t* builder,
         bucket = hash & mask;
     }
 
-    /* Add new entry */
     dict_entry_t* new_entry = malloc(sizeof(dict_entry_t) + value_size);
     if (!new_entry) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
     new_entry->data = (uint8_t*)(new_entry + 1);
-    memcpy(new_entry->data, value, value_size);
+    if (value_size > 0) memcpy(new_entry->data, value, value_size);
     new_entry->size = value_size;
     new_entry->hash = hash;
     new_entry->index = (uint32_t)builder->count;
     new_entry->next = builder->buckets[bucket];
     builder->buckets[bucket] = new_entry;
 
-    /* Add to dictionary buffer */
+    carquet_status_t status = CARQUET_OK;
     if (builder->is_variable_length) {
-        /* Write length prefix */
-        uint32_t len = (uint32_t)value_size;
-        carquet_buffer_append_u32_le(&builder->dict_buffer, len);
+        status = carquet_buffer_append_u32_le(&builder->dict_buffer, (uint32_t)value_size);
     }
-    carquet_buffer_append(&builder->dict_buffer, value, value_size);
+    if (status == CARQUET_OK && value_size > 0) {
+        status = carquet_buffer_append(&builder->dict_buffer, value, value_size);
+    }
+    if (status != CARQUET_OK) {
+        return status;
+    }
 
-    builder->indices[builder->indices_count++] = new_entry->index;
+    *index = new_entry->index;
     builder->count++;
-
     return CARQUET_OK;
+}
+
+static carquet_status_t dict_builder_add(dict_builder_t* builder,
+                                          const uint8_t* value,
+                                          size_t value_size) {
+    /* Ensure indices array has space */
+    if (builder->indices_count >= builder->indices_capacity) {
+        size_t new_cap = builder->indices_capacity * 2;
+        uint32_t* new_indices = realloc(builder->indices, new_cap * sizeof(uint32_t));
+        if (!new_indices) {
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        builder->indices = new_indices;
+        builder->indices_capacity = new_cap;
+    }
+
+    uint32_t index = 0;
+    carquet_status_t status = dict_builder_find_or_insert(builder, value, value_size, &index);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+    builder->indices[builder->indices_count++] = index;
+    return CARQUET_OK;
+}
+
+/* ============================================================================
+ * Byte-array dictionary of one column chunk (the writer's, across pages)
+ * ============================================================================
+ */
+
+struct carquet_byte_array_dictionary {
+    dict_builder_t builder;
+};
+
+carquet_byte_array_dictionary_t* carquet_byte_array_dictionary_create(void) {
+    carquet_byte_array_dictionary_t* dictionary = calloc(1, sizeof(*dictionary));
+    if (!dictionary) return NULL;
+    if (dict_builder_init(&dictionary->builder, 1, 0, true) != CARQUET_OK) {
+        free(dictionary);
+        return NULL;
+    }
+    return dictionary;
+}
+
+void carquet_byte_array_dictionary_destroy(carquet_byte_array_dictionary_t* dictionary) {
+    if (!dictionary) return;
+    dict_builder_destroy(&dictionary->builder);
+    free(dictionary);
+}
+
+carquet_status_t carquet_byte_array_dictionary_clear(carquet_byte_array_dictionary_t* dictionary) {
+    dict_builder_destroy(&dictionary->builder);
+    return dict_builder_init(&dictionary->builder, 1, 0, true);
+}
+
+carquet_status_t carquet_byte_array_dictionary_insert(
+    carquet_byte_array_dictionary_t* dictionary,
+    const uint8_t* value, size_t value_size, uint32_t* index) {
+    return dict_builder_find_or_insert(&dictionary->builder, value, value_size, index);
+}
+
+uint32_t carquet_byte_array_dictionary_count(const carquet_byte_array_dictionary_t* dictionary) {
+    return (uint32_t)dictionary->builder.count;
+}
+
+const uint8_t* carquet_byte_array_dictionary_plain(
+    const carquet_byte_array_dictionary_t* dictionary, size_t* size) {
+    *size = dictionary->builder.dict_buffer.size;
+    return dictionary->builder.dict_buffer.data;
 }
 
 /* ============================================================================

@@ -17,6 +17,7 @@
 #include "reader/reader_internal.h"
 #include "thrift/thrift_encode.h"
 #include "thrift/parquet_types.h"
+#include "writer/column_chunk_info.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -28,22 +29,6 @@ static const uint8_t PARQUET_MAGIC[4] = {'P', 'A', 'R', '1'};
 /* Forward declaration from row_group_writer.c */
 typedef struct carquet_row_group_writer carquet_row_group_writer_t;
 
-typedef struct column_chunk_info {
-    int64_t file_offset;
-    int64_t total_compressed_size;
-    int64_t total_uncompressed_size;
-    int64_t num_values;
-    bool has_statistics;
-    int64_t null_count;
-    uint8_t min_value[64];
-    uint8_t max_value[64];
-    size_t min_max_size;
-    carquet_physical_type_t type;
-    carquet_encoding_t encoding;
-    carquet_compression_t compression;
-    int32_t type_length;
-    char* path;
-} column_chunk_info_t;
 
 extern carquet_row_group_writer_t* carquet_row_group_writer_create(
     const carquet_schema_t* schema,
@@ -63,7 +48,8 @@ extern carquet_status_t carquet_row_group_writer_add_column(
     const carquet_logical_type_t* logical_type,
     int16_t max_def_level,
     int16_t max_rep_level,
-    int32_t type_length);
+    int32_t type_length,
+    bool use_dictionary);
 
 extern carquet_status_t carquet_row_group_writer_write_column(
     carquet_row_group_writer_t* writer,
@@ -143,13 +129,19 @@ typedef struct row_group_column_info {
     int64_t total_uncompressed_size;
     int64_t num_values;
     bool has_statistics;
+    bool has_min_max;
     int64_t null_count;
-    uint8_t min_value[64];
-    uint8_t max_value[64];
-    size_t min_max_size;
+    uint8_t* min_value;   /* in the writer's arena */
+    size_t min_size;
+    uint8_t* max_value;   /* in the writer's arena */
+    size_t max_size;
     carquet_physical_type_t type;
     carquet_compression_t codec;
+    bool has_dictionary_page_offset;
+    int64_t dictionary_page_offset;
     int64_t data_page_offset;
+    carquet_encoding_t encodings[3];
+    int32_t num_encodings;
     bool has_bloom_filter_offset;
     int64_t bloom_filter_offset;
     bool has_bloom_filter_length;
@@ -194,7 +186,6 @@ struct carquet_writer {
     int32_t num_schema_elements;
     char*** column_paths;
     int32_t* column_path_lens;
-    carquet_encoding_t (*column_encodings)[2];
 
     /* Options */
     carquet_writer_options_t options;
@@ -284,11 +275,23 @@ static int64_t estimate_column_batch_bytes(
     const int16_t* def_levels,
     const int16_t* rep_levels) {
 
-    if (!column || !values || num_values <= 0) {
+    if (!column || num_values <= 0) {
         return 0;
     }
 
     int64_t total = 0;
+
+    /* The values are packed: only the non-null ones. */
+    int64_t num_non_null = num_values;
+    if (column->max_def_level > 0 && def_levels) {
+        num_non_null = 0;
+        for (int64_t i = 0; i < num_values; i++) {
+            if (def_levels[i] == column->max_def_level) num_non_null++;
+        }
+    }
+    if (!values) {
+        num_non_null = 0;
+    }
 
     switch (column->physical_type) {
         case CARQUET_PHYSICAL_BOOLEAN:
@@ -313,7 +316,7 @@ static int64_t estimate_column_batch_bytes(
             break;
         case CARQUET_PHYSICAL_BYTE_ARRAY: {
             const carquet_byte_array_t* arrays = (const carquet_byte_array_t*)values;
-            for (int64_t i = 0; i < num_values; i++) {
+            for (int64_t i = 0; i < num_non_null; i++) {
                 total = saturating_add_i64(total, sizeof(uint32_t));
                 total = saturating_add_i64(total, arrays[i].length);
             }
@@ -462,10 +465,8 @@ static carquet_status_t build_column_metadata_cache(
 
     writer->column_paths = calloc((size_t)schema->num_leaves, sizeof(char**));
     writer->column_path_lens = calloc((size_t)schema->num_leaves, sizeof(int32_t));
-    writer->column_encodings = calloc((size_t)schema->num_leaves,
-        sizeof(*writer->column_encodings));
 
-    if (!writer->column_paths || !writer->column_path_lens || !writer->column_encodings) {
+    if (!writer->column_paths || !writer->column_path_lens) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
@@ -496,14 +497,6 @@ static carquet_status_t build_column_metadata_cache(
                 cur = schema->parent_indices[cur];
             }
         }
-
-        writer->column_encodings[i][0] =
-            (writer->options.compression != CARQUET_COMPRESSION_UNCOMPRESSED &&
-             (schema->elements[elem_idx].type == CARQUET_PHYSICAL_FLOAT ||
-              schema->elements[elem_idx].type == CARQUET_PHYSICAL_DOUBLE))
-                ? CARQUET_ENCODING_BYTE_STREAM_SPLIT
-                : CARQUET_ENCODING_PLAIN;
-        writer->column_encodings[i][1] = CARQUET_ENCODING_RLE;
     }
 
     return CARQUET_OK;
@@ -596,7 +589,9 @@ static carquet_status_t ensure_row_group(carquet_writer_t* writer) {
             &col->logical_type,
             col->max_def_level,
             col->max_rep_level,
-            col->type_length);
+            col->type_length,
+            writer->column_overrides_allocated &&
+                writer->column_encoding_overrides[i] == CARQUET_ENCODING_RLE_DICTIONARY);
 
         if (status != CARQUET_OK) {
             carquet_row_group_writer_destroy(writer->current_row_group);
@@ -671,15 +666,27 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
         chunk->codec = col_info->compression;
         chunk->num_values = col_info->num_values;
         chunk->has_statistics = col_info->has_statistics;
+        chunk->has_min_max = col_info->has_statistics && col_info->has_min_max;
         chunk->null_count = col_info->null_count;
-        chunk->min_max_size = col_info->min_max_size;
-        if (col_info->has_statistics) {
-            memcpy(chunk->min_value, col_info->min_value, col_info->min_max_size);
-            memcpy(chunk->max_value, col_info->max_value, col_info->min_max_size);
+        if (chunk->has_min_max) {
+            /* One extra byte keeps an empty bound's copy non-NULL. */
+            chunk->min_value = carquet_arena_alloc(&writer->arena, col_info->min_size + 1);
+            chunk->max_value = carquet_arena_alloc(&writer->arena, col_info->max_size + 1);
+            if (!chunk->min_value || !chunk->max_value) {
+                return CARQUET_ERROR_OUT_OF_MEMORY;
+            }
+            if (col_info->min_size > 0) memcpy(chunk->min_value, col_info->min_value, col_info->min_size);
+            if (col_info->max_size > 0) memcpy(chunk->max_value, col_info->max_value, col_info->max_size);
+            chunk->min_size = col_info->min_size;
+            chunk->max_size = col_info->max_size;
         }
         chunk->total_compressed_size = col_info->total_compressed_size;
         chunk->total_uncompressed_size = col_info->total_uncompressed_size;
-        chunk->data_page_offset = col_info->file_offset;
+        chunk->has_dictionary_page_offset = col_info->dictionary_page_size > 0;
+        chunk->dictionary_page_offset = col_info->file_offset;
+        chunk->data_page_offset = col_info->file_offset + col_info->dictionary_page_size;
+        chunk->num_encodings = col_info->num_encodings;
+        memcpy(chunk->encodings, col_info->encodings, sizeof(chunk->encodings));
     }
 
     writer->num_row_groups++;
@@ -825,6 +832,9 @@ static carquet_status_t build_file_metadata(
 
     metadata->version = 2;  /* Parquet version 2 */
     metadata->num_rows = writer->total_rows;
+    /* Every leaf's statistics are in its type's defined order
+     * (stats_order.h), so readers take min_value/max_value. */
+    metadata->num_type_defined_column_orders = writer->num_columns;
     metadata->created_by = carquet_arena_strdup(&writer->arena,
         writer->options.created_by ? writer->options.created_by : "Carquet");
 
@@ -902,25 +912,27 @@ static carquet_status_t build_file_metadata(
             meta->total_compressed_size = src_col->total_compressed_size;
             meta->total_uncompressed_size = src_col->total_uncompressed_size;
             meta->data_page_offset = src_col->data_page_offset;
+            meta->has_dictionary_page_offset = src_col->has_dictionary_page_offset;
+            meta->dictionary_page_offset = src_col->dictionary_page_offset;
             if (src_col->has_statistics) {
+                /* The null count always; the exact bounds when the chunk
+                 * holds a non-null value. */
                 meta->has_statistics = true;
                 meta->statistics.has_null_count = true;
                 meta->statistics.null_count = src_col->null_count;
-                meta->statistics.min_value = carquet_arena_memdup(
-                    &writer->arena, src_col->min_value, src_col->min_max_size);
-                meta->statistics.min_value_len = (int32_t)src_col->min_max_size;
-                meta->statistics.max_value = carquet_arena_memdup(
-                    &writer->arena, src_col->max_value, src_col->min_max_size);
-                meta->statistics.max_value_len = (int32_t)src_col->min_max_size;
-                meta->statistics.is_max_value_exact = true;
-                meta->statistics.is_min_value_exact = true;
-                if ((!meta->statistics.min_value || !meta->statistics.max_value) &&
-                    src_col->min_max_size > 0) {
-                    return CARQUET_ERROR_OUT_OF_MEMORY;
+                if (src_col->has_min_max) {
+                    meta->statistics.has_min_value = true;
+                    meta->statistics.min_value = src_col->min_value;
+                    meta->statistics.min_value_len = (int32_t)src_col->min_size;
+                    meta->statistics.has_max_value = true;
+                    meta->statistics.max_value = src_col->max_value;
+                    meta->statistics.max_value_len = (int32_t)src_col->max_size;
+                    meta->statistics.is_max_value_exact = true;
+                    meta->statistics.is_min_value_exact = true;
                 }
             }
-            meta->num_encodings = 2;
-            meta->encodings = writer->column_encodings[j];
+            meta->num_encodings = src_col->num_encodings;
+            meta->encodings = (carquet_encoding_t*)src_col->encodings;
             meta->path_len = writer->column_path_lens[j];
             meta->path_in_schema = writer->column_paths[j];
 
@@ -1119,7 +1131,8 @@ carquet_status_t carquet_writer_write_batch(
     const int16_t* def_levels,
     const int16_t* rep_levels) {
 
-    /* writer and values are nonnull per API contract */
+    /* writer is nonnull per API contract; values is NULL only for a batch
+     * of nulls */
     if (column_index < 0 || column_index >= writer->num_columns) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
@@ -1330,7 +1343,6 @@ cleanup:
         free(writer->column_paths);
     }
     free(writer->column_path_lens);
-    free(writer->column_encodings);
 
     free(writer->column_values_written);
     if (writer->row_groups) {
@@ -1402,7 +1414,6 @@ void carquet_writer_abort(carquet_writer_t* writer) {
         free(writer->column_paths);
     }
     free(writer->column_path_lens);
-    free(writer->column_encodings);
 
     free(writer->column_values_written);
     if (writer->row_groups) {
@@ -1476,6 +1487,29 @@ carquet_status_t carquet_writer_set_column_encoding(
     /* writer is nonnull per API contract */
     if (column_index < 0 || column_index >= writer->num_columns) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    /* The encodings a column writer is created with: the automatic one
+     * (PLAIN, or BYTE_STREAM_SPLIT for a compressed float) or, for a
+     * BYTE_ARRAY, a dictionary per column chunk (RLE_DICTIONARY data
+     * pages after one PLAIN dictionary page; PLAIN_DICTIONARY is taken as
+     * its deprecated name). A column writer is created with the file's
+     * first row group, so the choice is made before the first write. The
+     * page index would record data-page offsets the dictionary page
+     * shifts, so the two are not combined. */
+    if (writer->current_row_group) {
+        return CARQUET_ERROR_INVALID_STATE;
+    }
+    if (encoding == CARQUET_ENCODING_PLAIN_DICTIONARY) {
+        encoding = CARQUET_ENCODING_RLE_DICTIONARY;
+    }
+    if (encoding == CARQUET_ENCODING_RLE_DICTIONARY &&
+        (writer->columns[column_index].physical_type != CARQUET_PHYSICAL_BYTE_ARRAY ||
+         writer->options.write_page_index)) {
+        return CARQUET_ERROR_NOT_IMPLEMENTED;
+    }
+    if (encoding != CARQUET_ENCODING_PLAIN && encoding != CARQUET_ENCODING_RLE_DICTIONARY) {
+        return CARQUET_ERROR_NOT_IMPLEMENTED;
     }
 
     carquet_status_t status = ensure_column_overrides(writer);

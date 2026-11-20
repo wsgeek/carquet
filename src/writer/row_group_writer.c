@@ -12,6 +12,7 @@
 #include "core/compat.h"
 #include "thrift/thrift_encode.h"
 #include "thrift/parquet_types.h"
+#include "writer/column_chunk_info.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -78,32 +79,21 @@ extern carquet_offset_index_builder_t* carquet_column_writer_get_offset_index(
     const carquet_column_writer_internal_t* writer);
 extern bool carquet_column_writer_get_statistics(
     const carquet_column_writer_internal_t* writer,
+    bool* has_min_max,
     const uint8_t** min_value,
+    size_t* min_size,
     const uint8_t** max_value,
-    size_t* value_size,
+    size_t* max_size,
     int64_t* null_count);
+extern int64_t carquet_column_writer_dictionary_page_size(
+    const carquet_column_writer_internal_t* writer);
+extern int32_t carquet_column_writer_encodings(
+    const carquet_column_writer_internal_t* writer, carquet_encoding_t encodings[3]);
 
 /* ============================================================================
  * Column Chunk Metadata
  * ============================================================================
  */
-
-typedef struct column_chunk_info {
-    int64_t file_offset;
-    int64_t total_compressed_size;
-    int64_t total_uncompressed_size;
-    int64_t num_values;
-    bool has_statistics;
-    int64_t null_count;
-    uint8_t min_value[64];
-    uint8_t max_value[64];
-    size_t min_max_size;
-    carquet_physical_type_t type;
-    carquet_encoding_t encoding;
-    carquet_compression_t compression;
-    int32_t type_length;
-    char* path;
-} column_chunk_info_t;
 
 /* ============================================================================
  * Row Group Writer Structure
@@ -272,7 +262,8 @@ carquet_status_t carquet_row_group_writer_add_column(
     const carquet_logical_type_t* logical_type,
     int16_t max_def_level,
     int16_t max_rep_level,
-    int32_t type_length) {
+    int32_t type_length,
+    bool use_dictionary) {
 
     if (!writer || !name) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
@@ -299,7 +290,9 @@ carquet_status_t carquet_row_group_writer_add_column(
     writer->column_infos = new_infos;
 
     /* Create column writer */
-    carquet_encoding_t encoding = choose_column_encoding(type, writer->compression);
+    carquet_encoding_t encoding = use_dictionary
+        ? CARQUET_ENCODING_RLE_DICTIONARY
+        : choose_column_encoding(type, writer->compression);
 
     carquet_column_writer_internal_t* col_writer = carquet_column_writer_create(
         type,
@@ -331,7 +324,6 @@ carquet_status_t carquet_row_group_writer_add_column(
     /* Initialize column info */
     memset(&writer->column_infos[writer->num_columns], 0, sizeof(column_chunk_info_t));
     writer->column_infos[writer->num_columns].type = type;
-    writer->column_infos[writer->num_columns].encoding = encoding;
     writer->column_infos[writer->num_columns].compression = writer->compression;
     writer->column_infos[writer->num_columns].type_length = type_length;
     writer->column_infos[writer->num_columns].path = carquet_heap_strdup(name);
@@ -367,6 +359,25 @@ carquet_status_t carquet_row_group_writer_write_column(
  * ============================================================================
  */
 
+/* The one record of a finalized column chunk, whichever path finalized it. */
+static void capture_column_info(carquet_row_group_writer_t* writer, int i,
+                                int64_t file_offset, size_t size,
+                                int64_t total_values, int64_t uncompressed_size) {
+    column_chunk_info_t* info = &writer->column_infos[i];
+    const carquet_column_writer_internal_t* column = writer->column_writers[i];
+    info->file_offset = file_offset;
+    info->total_compressed_size = (int64_t)size;
+    info->total_uncompressed_size = uncompressed_size;
+    info->num_values = total_values;
+    info->has_min_max = false;
+    info->null_count = 0;
+    info->has_statistics = carquet_column_writer_get_statistics(
+        column, &info->has_min_max, &info->min_value, &info->min_size,
+        &info->max_value, &info->max_size, &info->null_count);
+    info->dictionary_page_size = carquet_column_writer_dictionary_page_size(column);
+    info->num_encodings = carquet_column_writer_encodings(column, info->encodings);
+}
+
 carquet_status_t carquet_row_group_writer_finalize(
     carquet_row_group_writer_t* writer,
     const uint8_t** data,
@@ -396,10 +407,8 @@ carquet_status_t carquet_row_group_writer_finalize(
         }
 
         for (int i = 0; i < writer->num_columns; i++) {
-            writer->column_infos[i].file_offset = current_offset;
-            writer->column_infos[i].total_compressed_size = chunks[i].size;
-            writer->column_infos[i].total_uncompressed_size = chunks[i].uncompressed_size;
-            writer->column_infos[i].num_values = chunks[i].total_values;
+            capture_column_info(writer, i, current_offset, chunks[i].size,
+                                chunks[i].total_values, chunks[i].uncompressed_size);
 
             status = carquet_buffer_append(&writer->row_group_buffer, chunks[i].data, chunks[i].size);
             if (status != CARQUET_OK) {
@@ -437,11 +446,7 @@ carquet_status_t carquet_row_group_writer_finalize(
             return status;
         }
 
-        /* Update column info */
-        writer->column_infos[i].file_offset = current_offset;
-        writer->column_infos[i].total_compressed_size = col_size;
-        writer->column_infos[i].total_uncompressed_size = uncompressed_size;
-        writer->column_infos[i].num_values = total_values;
+        capture_column_info(writer, i, current_offset, col_size, total_values, uncompressed_size);
 
         /* Append column data */
         status = carquet_buffer_append(&writer->row_group_buffer, col_data, col_size);
@@ -487,22 +492,8 @@ carquet_status_t carquet_row_group_writer_write_to_file(
         }
 
         for (int i = 0; i < writer->num_columns; i++) {
-            const uint8_t* min_value = NULL;
-            const uint8_t* max_value = NULL;
-            size_t min_max_size = 0;
-            int64_t null_count = 0;
-            writer->column_infos[i].file_offset = current_offset;
-            writer->column_infos[i].total_compressed_size = chunks[i].size;
-            writer->column_infos[i].total_uncompressed_size = chunks[i].uncompressed_size;
-            writer->column_infos[i].num_values = chunks[i].total_values;
-            writer->column_infos[i].has_statistics = carquet_column_writer_get_statistics(
-                writer->column_writers[i], &min_value, &max_value, &min_max_size, &null_count);
-            writer->column_infos[i].null_count = null_count;
-            writer->column_infos[i].min_max_size = min_max_size;
-            if (writer->column_infos[i].has_statistics) {
-                memcpy(writer->column_infos[i].min_value, min_value, min_max_size);
-                memcpy(writer->column_infos[i].max_value, max_value, min_max_size);
-            }
+            capture_column_info(writer, i, current_offset, chunks[i].size,
+                                chunks[i].total_values, chunks[i].uncompressed_size);
 
             if (chunks[i].size > 0) {
                 if (fwrite(chunks[i].data, 1, chunks[i].size, file) != chunks[i].size) {
@@ -529,10 +520,6 @@ carquet_status_t carquet_row_group_writer_write_to_file(
         int64_t total_values;
         int64_t compressed_size;
         int64_t uncompressed_size;
-        const uint8_t* min_value = NULL;
-        const uint8_t* max_value = NULL;
-        size_t min_max_size = 0;
-        int64_t null_count = 0;
 
         carquet_column_writer_set_file_offset(writer->column_writers[i], current_offset);
 
@@ -543,18 +530,7 @@ carquet_status_t carquet_row_group_writer_write_to_file(
 
         if (status != CARQUET_OK) return status;
 
-        writer->column_infos[i].file_offset = current_offset;
-        writer->column_infos[i].total_compressed_size = col_size;
-        writer->column_infos[i].total_uncompressed_size = uncompressed_size;
-        writer->column_infos[i].num_values = total_values;
-        writer->column_infos[i].has_statistics = carquet_column_writer_get_statistics(
-            writer->column_writers[i], &min_value, &max_value, &min_max_size, &null_count);
-        writer->column_infos[i].null_count = null_count;
-        writer->column_infos[i].min_max_size = min_max_size;
-        if (writer->column_infos[i].has_statistics) {
-            memcpy(writer->column_infos[i].min_value, min_value, min_max_size);
-            memcpy(writer->column_infos[i].max_value, max_value, min_max_size);
-        }
+        capture_column_info(writer, i, current_offset, col_size, total_values, uncompressed_size);
 
         if (col_size > 0) {
             if (fwrite(col_data, 1, col_size, file) != col_size) {

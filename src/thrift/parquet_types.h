@@ -103,11 +103,13 @@ struct parquet_statistics {
     bool has_distinct_count;
     int64_t distinct_count;
 
-    /* Field 5: max_value */
+    /* Field 5: max_value (has_max_value: present, possibly empty) */
+    bool has_max_value;
     uint8_t* max_value;
     int32_t max_value_len;
 
-    /* Field 6: min_value */
+    /* Field 6: min_value (has_min_value: present, possibly empty) */
+    bool has_min_value;
     uint8_t* min_value;
     int32_t min_value_len;
 
@@ -293,7 +295,10 @@ struct parquet_file_metadata {
     /* Field 6: created_by */
     char* created_by;
 
-    /* Field 7: column_orders (we skip for now) */
+    /* Field 7: column_orders: TYPE_ORDER for each of this many leaf
+     * columns (0 = none written). Readers use min_value/max_value only
+     * under a defined column order. */
+    int32_t num_type_defined_column_orders;
 
     /* Field 8: encryption_algorithm (we skip for now) */
 
