@@ -312,12 +312,7 @@ void carquet_column_writer_reset(carquet_column_writer_internal_t* writer) {
     carquet_buffer_clear(&writer->max_value);
     writer->dictionary_page_size = 0;
     if (writer->dictionary) {
-        /* A failed clear (out of memory) drops the dictionary; the next
-         * write reports it. */
-        if (carquet_byte_array_dictionary_clear(writer->dictionary) != CARQUET_OK) {
-            carquet_byte_array_dictionary_destroy(writer->dictionary);
-            writer->dictionary = NULL;
-        }
+        carquet_byte_array_dictionary_clear(writer->dictionary);
     }
     writer->page_row_offset = 0;
     writer->column_file_offset = 0;
@@ -415,8 +410,10 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
             return status;
         }
     }
-    writer->total_uncompressed_size += uncompressed_size;
-    writer->total_compressed_size += compressed_size;
+    /* The footer's sizes count each page's header (page_size less its
+     * compressed payload) with its payload. */
+    writer->total_uncompressed_size += uncompressed_size + ((int64_t)page_size - compressed_size);
+    writer->total_compressed_size += (int64_t)page_size;
     writer->num_pages++;
 
     /* Reset page writer for next page */
@@ -513,9 +510,6 @@ carquet_status_t carquet_column_writer_write_batch(
 
     if (!writer) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
-    }
-    if (writer->encoding == CARQUET_ENCODING_RLE_DICTIONARY && !writer->dictionary) {
-        return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
     /* Split large batches into page-sized chunks: fixed-size values by
@@ -638,8 +632,8 @@ static carquet_status_t prepend_dictionary_page(carquet_column_writer_internal_t
     carquet_buffer_destroy(&writer->column_buffer);
     writer->column_buffer = chunk;
     writer->dictionary_page_size = (int64_t)page_size;
-    writer->total_uncompressed_size += uncompressed_size;
-    writer->total_compressed_size += compressed_size;
+    writer->total_uncompressed_size += uncompressed_size + ((int64_t)page_size - compressed_size);
+    writer->total_compressed_size += (int64_t)page_size;
 
     if (!writer->write_statistics) {
         return CARQUET_OK;

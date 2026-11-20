@@ -89,6 +89,8 @@ typedef struct carquet_page_writer {
     carquet_buffer_t page_buffer;        /* Final page with header */
     carquet_buffer_t compress_buffer;   /* Reusable compression buffer */
     carquet_buffer_t indices_buffer;    /* RLE_DICTIONARY: the page's uint32 indices */
+    carquet_buffer_t bools_raw;         /* BOOLEAN: the page's values, one byte each,
+                                           bit-packed once at finalize */
 
     carquet_physical_type_t type;
     carquet_encoding_t encoding;
@@ -197,6 +199,7 @@ carquet_page_writer_t* carquet_page_writer_create(
     carquet_buffer_init(&writer->page_buffer);
     carquet_buffer_init(&writer->compress_buffer);
     carquet_buffer_init(&writer->indices_buffer);
+    carquet_buffer_init(&writer->bools_raw);
 
     writer->type = type;
     writer->encoding = encoding;
@@ -224,6 +227,7 @@ void carquet_page_writer_destroy(carquet_page_writer_t* writer) {
         carquet_buffer_destroy(&writer->page_buffer);
         carquet_buffer_destroy(&writer->compress_buffer);
         carquet_buffer_destroy(&writer->indices_buffer);
+        carquet_buffer_destroy(&writer->bools_raw);
         free(writer);
     }
 }
@@ -238,6 +242,7 @@ void carquet_page_writer_reset(carquet_page_writer_t* writer) {
     carquet_buffer_clear(&writer->page_buffer);
     carquet_buffer_clear(&writer->compress_buffer);
     carquet_buffer_clear(&writer->indices_buffer);
+    carquet_buffer_clear(&writer->bools_raw);
     writer->num_values = 0;
     writer->num_nulls = 0;
     writer->has_min_max = false;
@@ -763,9 +768,10 @@ carquet_status_t carquet_page_writer_add_values(
      */
     switch (writer->type) {
         case CARQUET_PHYSICAL_BOOLEAN: {
+            /* Kept whole and bit-packed once at finalize: packing per
+             * batch would pad each batch to a byte. */
             const uint8_t* bools = (const uint8_t*)values;
-            status = carquet_encode_plain_boolean(bools, num_non_null,
-                                                   &writer->values_buffer);
+            status = carquet_buffer_append(&writer->bools_raw, bools, (size_t)num_non_null);
             if (status == CARQUET_OK && writer->write_statistics) {
                 update_statistics_fixed_bytes(writer, bools, num_non_null, 1);
             }
@@ -1115,6 +1121,15 @@ carquet_status_t carquet_page_writer_finalize_to_buffer(
         return levels_status;
     }
 
+    if (writer->type == CARQUET_PHYSICAL_BOOLEAN) {
+        carquet_buffer_clear(&writer->values_buffer);
+        carquet_status_t encode_status = carquet_encode_plain_boolean(
+            writer->bools_raw.data, (int64_t)writer->bools_raw.size, &writer->values_buffer);
+        if (encode_status != CARQUET_OK) {
+            return encode_status;
+        }
+    }
+
     if (writer->encoding == CARQUET_ENCODING_RLE_DICTIONARY) {
         /* The page's values: the indices' bit width, one byte, then their
          * RLE/bit-packed hybrid with no length prefix. */
@@ -1316,6 +1331,7 @@ size_t carquet_page_writer_estimated_size(const carquet_page_writer_t* writer) {
     if (!writer) return 0;
     return writer->values_buffer.size +
            writer->indices_buffer.size +
+           writer->bools_raw.size / 8 +
            64;  /* Header overhead; the levels, RLE-encoded at finalize, are small beside the values */
 }
 

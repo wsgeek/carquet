@@ -1489,26 +1489,23 @@ carquet_status_t carquet_writer_set_column_encoding(
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
-    /* The encodings a column writer is created with: the automatic one
-     * (PLAIN, or BYTE_STREAM_SPLIT for a compressed float) or, for a
-     * BYTE_ARRAY, a dictionary per column chunk (RLE_DICTIONARY data
-     * pages after one PLAIN dictionary page; PLAIN_DICTIONARY is taken as
-     * its deprecated name). A column writer is created with the file's
-     * first row group, so the choice is made before the first write. The
-     * page index would record data-page offsets the dictionary page
-     * shifts, so the two are not combined. */
+    /* The one override: for a BYTE_ARRAY, a dictionary per column chunk
+     * (RLE_DICTIONARY data pages after one PLAIN dictionary page;
+     * PLAIN_DICTIONARY is taken as its deprecated name) in place of the
+     * automatic encoding (PLAIN, or BYTE_STREAM_SPLIT for a compressed
+     * float). A column writer is created with the file's first row group,
+     * so the choice is made before the first write. The page index would
+     * record data-page offsets the dictionary page shifts, so the two are
+     * not combined. */
     if (writer->current_row_group) {
         return CARQUET_ERROR_INVALID_STATE;
     }
     if (encoding == CARQUET_ENCODING_PLAIN_DICTIONARY) {
         encoding = CARQUET_ENCODING_RLE_DICTIONARY;
     }
-    if (encoding == CARQUET_ENCODING_RLE_DICTIONARY &&
-        (writer->columns[column_index].physical_type != CARQUET_PHYSICAL_BYTE_ARRAY ||
-         writer->options.write_page_index)) {
-        return CARQUET_ERROR_NOT_IMPLEMENTED;
-    }
-    if (encoding != CARQUET_ENCODING_PLAIN && encoding != CARQUET_ENCODING_RLE_DICTIONARY) {
+    if (encoding != CARQUET_ENCODING_RLE_DICTIONARY ||
+        writer->columns[column_index].physical_type != CARQUET_PHYSICAL_BYTE_ARRAY ||
+        writer->options.write_page_index) {
         return CARQUET_ERROR_NOT_IMPLEMENTED;
     }
 

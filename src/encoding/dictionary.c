@@ -234,14 +234,9 @@ static carquet_status_t dict_builder_find_or_insert(dict_builder_t* builder,
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
-    new_entry->data = (uint8_t*)(new_entry + 1);
-    if (value_size > 0) memcpy(new_entry->data, value, value_size);
-    new_entry->size = value_size;
-    new_entry->hash = hash;
-    new_entry->index = (uint32_t)builder->count;
-    new_entry->next = builder->buckets[bucket];
-    builder->buckets[bucket] = new_entry;
-
+    /* The entry's bytes go into the dictionary first, so a failed append
+     * leaves no index that refers to missing bytes. */
+    size_t dict_size = builder->dict_buffer.size;
     carquet_status_t status = CARQUET_OK;
     if (builder->is_variable_length) {
         status = carquet_buffer_append_u32_le(&builder->dict_buffer, (uint32_t)value_size);
@@ -250,8 +245,18 @@ static carquet_status_t dict_builder_find_or_insert(dict_builder_t* builder,
         status = carquet_buffer_append(&builder->dict_buffer, value, value_size);
     }
     if (status != CARQUET_OK) {
+        builder->dict_buffer.size = dict_size;
+        free(new_entry);
         return status;
     }
+
+    new_entry->data = (uint8_t*)(new_entry + 1);
+    if (value_size > 0) memcpy(new_entry->data, value, value_size);
+    new_entry->size = value_size;
+    new_entry->hash = hash;
+    new_entry->index = (uint32_t)builder->count;
+    new_entry->next = builder->buckets[bucket];
+    builder->buckets[bucket] = new_entry;
 
     *index = new_entry->index;
     builder->count++;
@@ -306,9 +311,21 @@ void carquet_byte_array_dictionary_destroy(carquet_byte_array_dictionary_t* dict
     free(dictionary);
 }
 
-carquet_status_t carquet_byte_array_dictionary_clear(carquet_byte_array_dictionary_t* dictionary) {
-    dict_builder_destroy(&dictionary->builder);
-    return dict_builder_init(&dictionary->builder, 1, 0, true);
+void carquet_byte_array_dictionary_clear(carquet_byte_array_dictionary_t* dictionary) {
+    /* In place: the entries freed, the buckets and buffers kept. */
+    dict_builder_t* builder = &dictionary->builder;
+    for (size_t i = 0; i < builder->num_buckets; i++) {
+        dict_entry_t* entry = builder->buckets[i];
+        while (entry) {
+            dict_entry_t* next = entry->next;
+            free(entry);
+            entry = next;
+        }
+        builder->buckets[i] = NULL;
+    }
+    builder->count = 0;
+    builder->indices_count = 0;
+    carquet_buffer_clear(&builder->dict_buffer);
 }
 
 carquet_status_t carquet_byte_array_dictionary_insert(

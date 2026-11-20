@@ -368,6 +368,8 @@ static void capture_column_info(carquet_row_group_writer_t* writer, int i,
     info->file_offset = file_offset;
     info->total_compressed_size = (int64_t)size;
     info->total_uncompressed_size = uncompressed_size;
+    /* RowGroup.total_byte_size: the uncompressed bytes of its chunks. */
+    writer->total_byte_size += uncompressed_size;
     info->num_values = total_values;
     info->has_min_max = false;
     info->null_count = 0;
@@ -417,7 +419,6 @@ carquet_status_t carquet_row_group_writer_finalize(
             }
 
             current_offset += chunks[i].size;
-            writer->total_byte_size += chunks[i].size;
         }
 
         free(chunks);
@@ -455,7 +456,6 @@ carquet_status_t carquet_row_group_writer_finalize(
         }
 
         current_offset += col_size;
-        writer->total_byte_size += col_size;
     }
 
     if (data) *data = writer->row_group_buffer.data;
@@ -503,7 +503,6 @@ carquet_status_t carquet_row_group_writer_write_to_file(
             }
 
             current_offset += chunks[i].size;
-            writer->total_byte_size += chunks[i].size;
             written += chunks[i].size;
         }
 
@@ -539,7 +538,6 @@ carquet_status_t carquet_row_group_writer_write_to_file(
         }
 
         current_offset += col_size;
-        writer->total_byte_size += col_size;
         written += col_size;
     }
 

@@ -20,8 +20,8 @@ typedef struct carquet_byte_array_dictionary carquet_byte_array_dictionary_t;
 carquet_byte_array_dictionary_t* carquet_byte_array_dictionary_create(void);
 void carquet_byte_array_dictionary_destroy(carquet_byte_array_dictionary_t* dictionary);
 
-/* Empties the dictionary for the next column chunk. */
-carquet_status_t carquet_byte_array_dictionary_clear(carquet_byte_array_dictionary_t* dictionary);
+/* Empties the dictionary for the next column chunk, in place. */
+void carquet_byte_array_dictionary_clear(carquet_byte_array_dictionary_t* dictionary);
 
 /* The value's index, its entry added when new; indices count from 0 in
  * insertion order. */

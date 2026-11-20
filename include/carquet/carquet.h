@@ -2588,7 +2588,12 @@ carquet_status_t carquet_reader_column_chunk_metadata(
 /**
  * @brief Set encoding for a specific column.
  *
- * Overrides the automatic encoding selection for this column.
+ * Overrides the automatic encoding selection for this column. The one
+ * override implemented: CARQUET_ENCODING_RLE_DICTIONARY (or the deprecated
+ * PLAIN_DICTIONARY) on a BYTE_ARRAY column, a dictionary per column chunk,
+ * called before the first write and without the page index; any other
+ * returns CARQUET_ERROR_NOT_IMPLEMENTED, after the first write
+ * CARQUET_ERROR_INVALID_STATE.
  *
  * @param[in] writer File writer
  * @param[in] column_index Column index
