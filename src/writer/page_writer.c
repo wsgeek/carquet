@@ -1122,11 +1122,14 @@ carquet_status_t carquet_page_writer_finalize_to_buffer(
     }
 
     if (writer->type == CARQUET_PHYSICAL_BOOLEAN) {
+        /* An all-null page has no values. */
         carquet_buffer_clear(&writer->values_buffer);
-        carquet_status_t encode_status = carquet_encode_plain_boolean(
-            writer->bools_raw.data, (int64_t)writer->bools_raw.size, &writer->values_buffer);
-        if (encode_status != CARQUET_OK) {
-            return encode_status;
+        if (writer->bools_raw.size > 0) {
+            carquet_status_t encode_status = carquet_encode_plain_boolean(
+                writer->bools_raw.data, (int64_t)writer->bools_raw.size, &writer->values_buffer);
+            if (encode_status != CARQUET_OK) {
+                return encode_status;
+            }
         }
     }
 
